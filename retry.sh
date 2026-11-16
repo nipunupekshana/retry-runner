@@ -13,7 +13,7 @@
 #   - instance already exists (earlier run, manual click)  -> issue + switch off (never a second instance)
 #   - accepted but TERMINATED while starting               -> keep trying
 #   - still starting after the wait                         -> issue ("check it") + switch off
-#   - full size out of capacity                             -> re-check nothing exists, then try the smaller size
+#   - two sizes, one launch per run                         -> odd run numbers full size, even run numbers smaller
 #   - out of capacity / rate limit / provider 5xx / network -> quiet, try next run
 #   - login or permission problem, limits exceeded          -> issue + switch off
 #   - image/subnet not found (lookup worked, found nothing) -> issue + switch off
@@ -189,7 +189,7 @@ fi
 T="$OCI_CLI_TENANCY"
 NAME="$INSTANCE_NAME"
 
-# --- 1. Already there? (checked again before the smaller-size try, so there is never a second instance) -------
+# --- 1. Already there? (never a second instance) -------------------------------------------------------------
 stop_if_exists() {
   run_oci compute instance list -c "$T" --display-name "$NAME" --all \
     --query 'length(data[?"lifecycle-state"!=`TERMINATED` && "lifecycle-state"!=`TERMINATING`])' --raw-output
@@ -247,8 +247,9 @@ EOF
 SSH_PUB="$TMP/ssh.pub"
 printf '%s\n' "$SSH_PUBLIC_KEY" > "$SSH_PUB"
 
-# --- 4. Launch; wait until it is RUNNING (or TERMINATED). Full size first; if that has no capacity, the smaller
-#        size right away (fits on more hosts; it can be resized up later: Edit -> Shape, one reboot). -------------
+# --- 4. ONE launch per run; wait until it is RUNNING (or TERMINATED). Odd-numbered runs try the full size, even-
+#        numbered runs the smaller size (fits on more hosts; resize it up later: Edit -> Shape, one reboot). Two
+#        launches seconds apart in one run were refused with "TooManyRequests", so never more than one. -----------
 FULL_SIZE='{"ocpus": 2, "memoryInGBs": 12}'
 SMALL_SIZE='{"ocpus": 1, "memoryInGBs": 6}'
 launch() { # $1 = shape config
@@ -265,12 +266,14 @@ launch() { # $1 = shape config
   STATE="${OUT//[[:space:]]/}"
 }
 SIZE_NOTE=""
-launch "$FULL_SIZE"
-if [ $RC -ne 0 ] && [ $RC -ne 2 ] && [ "$(classify "$ALL")" = capacity ]; then
-  echo "full size: out of capacity — trying the smaller size now"
-  stop_if_exists
+RUN_NO="${GITHUB_RUN_NUMBER:-}"
+if [[ "$RUN_NO" =~ ^[0-9]+$ ]] && [ $((RUN_NO % 2)) -eq 0 ]; then
+  echo "this run tries the smaller size"
+  SIZE_NOTE=" It is the smaller size (1 core / 6 GB), which fits on more hosts; resize it up later (Edit -> Shape, one reboot)."
   launch "$SMALL_SIZE"
-  SIZE_NOTE=" It is the smaller size (1 core / 6 GB) because the full size had no room; resize it up later (Edit -> Shape, one reboot)."
+else
+  echo "this run tries the full size"
+  launch "$FULL_SIZE"
 fi
 rm -f "$CI"
 

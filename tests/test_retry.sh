@@ -290,63 +290,50 @@ run_case disables_this_workflow_file 0 LAUNCH_OUT=RUNNING
 check grep -q 'gh workflow disable run.yml' "$LOG"
 finish disables_this_workflow_file
 
-# --- two sizes: the full size first; only when it has no capacity, the smaller size in the same run ----------
+# --- two sizes, ONE launch per run: two launches seconds apart got "TooManyRequests" (seen live, run #73).
+#     Odd-numbered runs try the full size, even-numbered runs the smaller size; unknown run number -> full. ------
 launches() { grep -c "instance launch" "$LOG"; }
 nth_launch_has() { grep "instance launch" "$LOG" | sed -n "$1p" | grep -qF -- "$2"; }
 FULL='"ocpus": 2, "memoryInGBs": 12'; SMALL='"ocpus": 1, "memoryInGBs": 6'
 RATE_ERR='ServiceError: {"code": "TooManyRequests", "message": "Too many requests for the user", "status": 429}'
 
-run_case full_size_tried_first 0 LAUNCH_OUT=RUNNING
-check test "$(launches)" = 1; check nth_launch_has 1 "$FULL"; nope flat_has 'smaller size'
-finish full_size_tried_first
+run_case odd_run_tries_full_size 0 GITHUB_RUN_NUMBER=75 LAUNCH_RC=1 LAUNCH_ERR="$CAP_ERR"
+check test "$(launches)" = 1; check nth_launch_has 1 "$FULL"; nope issued; nope disabled
+finish odd_run_tries_full_size
 
-run_case smaller_size_after_capacity 0 LAUNCH_RC=1 LAUNCH_ERR="$CAP_ERR"
-check test "$(launches)" = 2; check nth_launch_has 1 "$FULL"; check nth_launch_has 2 "$SMALL"
-nope issued; nope disabled; nope curl_called; check test ! -e "$WORK/cloud-init.yaml"
-finish smaller_size_after_capacity
+run_case even_run_tries_smaller_size 0 GITHUB_RUN_NUMBER=76 LAUNCH_RC=1 LAUNCH_ERR="$CAP_ERR"
+check test "$(launches)" = 1; check nth_launch_has 1 "$SMALL"; nope issued; nope disabled; nope curl_called
+finish even_run_tries_smaller_size
 
-run_case smaller_size_success 0 LAUNCH_RC=1 LAUNCH_ERR="$CAP_ERR" LAUNCH_2_RC=0 LAUNCH_2_OUT=RUNNING
+run_case even_run_rate_limited_one_launch 0 GITHUB_RUN_NUMBER=76 LAUNCH_RC=1 LAUNCH_ERR="$RATE_ERR"
+check test "$(launches)" = 1; nope issued; nope disabled
+finish even_run_rate_limited_one_launch
+
+run_case full_size_success_has_no_size_note 0 GITHUB_RUN_NUMBER=75 LAUNCH_OUT=RUNNING
+check issued; nope flat_has 'smaller size'
+finish full_size_success_has_no_size_note
+
+run_case smaller_size_success 0 GITHUB_RUN_NUMBER=76 LAUNCH_OUT=RUNNING
 check issued; check disabled; check trigger_off
 check flat_has 'gh issue create .*--title Done: instance created .*smaller size'
 check grep -q 'tskey-auth-SECRET123' "$WORK/cloud-init.copy"
 check test ! -e "$WORK/cloud-init.yaml"; check issues_clean; check no_leak smaller_size_success
 finish smaller_size_success
 
-run_case smaller_size_rechecks_existing_first 0 LAUNCH_RC=1 LAUNCH_ERR="$CAP_ERR" LIST_2_OUT=1
-check test "$(launches)" = 1; check flat_has 'Done: instance already exists'; check disabled
-check test ! -e "$WORK/cloud-init.yaml"
-finish smaller_size_rechecks_existing_first
-
-run_case smaller_size_recheck_network_blip 0 LAUNCH_RC=1 LAUNCH_ERR="$CAP_ERR" LIST_2_RC=1 LIST_2_ERR='RequestException: Max retries exceeded'
-check test "$(launches)" = 1; nope issued; nope disabled; check test ! -e "$WORK/cloud-init.yaml"
-finish smaller_size_recheck_network_blip
-
-run_case smaller_size_still_starting 0 LAUNCH_RC=1 LAUNCH_ERR="$CAP_ERR" LAUNCH_2_RC=2 LAUNCH_2_ERR="Timed out waiting for resource"
+run_case smaller_size_still_starting 0 GITHUB_RUN_NUMBER=76 LAUNCH_RC=2 LAUNCH_ERR="Timed out waiting for resource"
 check issued; check disabled; check flat_has 'Check: instance still starting'
 finish smaller_size_still_starting
 
-run_case smaller_size_rate_limited 0 LAUNCH_RC=1 LAUNCH_ERR="$CAP_ERR" LAUNCH_2_RC=1 LAUNCH_2_ERR="$RATE_ERR"
-check test "$(launches)" = 2; nope issued; nope disabled
-finish smaller_size_rate_limited
+run_case no_run_number_means_full_size 0 GITHUB_RUN_NUMBER= LAUNCH_RC=1 LAUNCH_ERR="$CAP_ERR"
+check test "$(launches)" = 1; check nth_launch_has 1 "$FULL"
+finish no_run_number_means_full_size
 
-run_case no_smaller_try_when_rate_limited 0 LAUNCH_RC=1 LAUNCH_ERR="$RATE_ERR"
-check test "$(launches)" = 1
-finish no_smaller_try_when_rate_limited
-
-run_case no_smaller_try_when_terminated 0 LAUNCH_OUT=TERMINATED
-check test "$(launches)" = 1
-finish no_smaller_try_when_terminated
-
-run_case no_smaller_try_when_still_starting 0 LAUNCH_RC=2 LAUNCH_ERR="Timed out waiting for resource"
-check test "$(launches)" = 1
-finish no_smaller_try_when_still_starting
-
-run_case no_smaller_try_on_unknown_error 0 LAUNCH_RC=1 LAUNCH_ERR='ServiceError: {"code": "Conflict", "message": "odd", "status": 409}'
-check test "$(launches)" = 1
-finish no_smaller_try_on_unknown_error
+run_case odd_text_run_number_means_full_size 0 GITHUB_RUN_NUMBER="7x" LAUNCH_RC=1 LAUNCH_ERR="$CAP_ERR"
+check test "$(launches)" = 1; check nth_launch_has 1 "$FULL"
+finish odd_text_run_number_means_full_size
 
 run_case bare_capacity_code_is_capacity 0 LAUNCH_RC=1 LAUNCH_ERR='ServiceError: {"code": "OutOfHostCapacity", "message": "No room right now"}'
-nope issued; check test "$(launches)" = 2
+nope issued; check grep -q "out of capacity" "$WORK/bare_capacity_code_is_capacity.out"
 finish bare_capacity_code_is_capacity
 
 echo "---- $PASS passed, $FAIL failed"
