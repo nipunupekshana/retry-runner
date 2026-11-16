@@ -13,6 +13,7 @@
 #   - instance already exists (earlier run, manual click)  -> issue + switch off (never a second instance)
 #   - accepted but TERMINATED while starting               -> keep trying
 #   - still starting after the wait                         -> issue ("check it") + switch off
+#   - full size out of capacity                             -> re-check nothing exists, then try the smaller size
 #   - out of capacity / rate limit / provider 5xx / network -> quiet, try next run
 #   - login or permission problem, limits exceeded          -> issue + switch off
 #   - image/subnet not found (lookup worked, found nothing) -> issue + switch off
@@ -71,7 +72,7 @@ provider_message() { # the provider's error code + message only
 
 classify() { # -> capacity | rate | auth | limit | transient | unknown
   local t="$1"
-  if grep -qiE 'out of (host )?capacity' <<<"$t"; then echo capacity
+  if grep -qiE 'out of (host )?capacity|OutOf(Host)?Capacity' <<<"$t"; then echo capacity
   elif grep -qE 'TooManyRequests|"status": 429' <<<"$t"; then echo rate
   elif grep -qE 'NotAuthenticated|NotAuthorized|"status": 40[13]|private key|fingerprint|key_content|key_file' <<<"$t"; then echo auth
   elif grep -qiE 'LimitExceeded|QuotaExceeded|limit exceeded' <<<"$t"; then echo limit
@@ -188,18 +189,21 @@ fi
 T="$OCI_CLI_TENANCY"
 NAME="$INSTANCE_NAME"
 
-# --- 1. Already there? --------------------------------------------------------------------------------------
-run_oci compute instance list -c "$T" --display-name "$NAME" --all \
-  --query 'length(data[?"lifecycle-state"!=`TERMINATED` && "lifecycle-state"!=`TERMINATING`])' --raw-output
-[ $RC -ne 0 ] && handle_failure "checking for an existing instance"
-existing="${OUT//[[:space:]]/}"; existing="${existing:-0}"   # prints nothing when the list is empty
-if ! [[ "$existing" =~ ^[0-9]+$ ]]; then echo "unexpected list output"; provider_message "$ALL"; exit 0; fi
-if [ "$existing" -gt 0 ]; then
-  echo "the instance already exists — switching the retry job off."
-  stop_job "Done: instance already exists" \
-    "The instance already exists, so this retry job has switched itself off (and its cron trigger). Next steps are in your private notes."
-  exit 0
-fi
+# --- 1. Already there? (checked again before the smaller-size try, so there is never a second instance) -------
+stop_if_exists() {
+  run_oci compute instance list -c "$T" --display-name "$NAME" --all \
+    --query 'length(data[?"lifecycle-state"!=`TERMINATED` && "lifecycle-state"!=`TERMINATING`])' --raw-output
+  [ $RC -ne 0 ] && handle_failure "checking for an existing instance"
+  local existing="${OUT//[[:space:]]/}"; existing="${existing:-0}"   # prints nothing when the list is empty
+  if ! [[ "$existing" =~ ^[0-9]+$ ]]; then echo "unexpected list output"; provider_message "$ALL"; exit 0; fi
+  if [ "$existing" -gt 0 ]; then
+    echo "the instance already exists — switching the retry job off."
+    stop_job "Done: instance already exists" \
+      "The instance already exists, so this retry job has switched itself off (and its cron trigger). Next steps are in your private notes."
+    exit 0
+  fi
+}
+stop_if_exists
 
 # --- 2. Look up zone, subnet and image by name (no hard-coded ids) ------------------------------------------
 run_oci iam availability-domain list -c "$T" --query 'data[0].name' --raw-output
@@ -232,6 +236,7 @@ done
 # --- 3. First-boot script: join the private network, retrying through network hiccups. Never printed. --------
 umask 077
 CI="$TMP/cloud-init.yaml"
+trap 'rm -f "$CI"' EXIT   # removed however this run ends
 cat > "$CI" <<EOF
 #cloud-config
 runcmd:
@@ -242,26 +247,39 @@ EOF
 SSH_PUB="$TMP/ssh.pub"
 printf '%s\n' "$SSH_PUBLIC_KEY" > "$SSH_PUB"
 
-# --- 4. One launch attempt; wait until it is RUNNING (or TERMINATED) ----------------------------------------
-run_oci compute instance launch \
-  --compartment-id "$T" --availability-domain "$AD" --display-name "$NAME" \
-  --shape "$SHAPE" --shape-config '{"ocpus": 2, "memoryInGBs": 12}' \
-  --image-id "$IMAGE" --subnet-id "$SUBNET" --assign-public-ip true \
-  --boot-volume-size-in-gbs 100 --is-pv-encryption-in-transit-enabled true \
-  --ssh-authorized-keys-file "$SSH_PUB" --user-data-file "$CI" \
-  --instance-options '{"areLegacyImdsEndpointsDisabled": true}' \
-  --agent-config '{"isMonitoringDisabled": false, "isManagementDisabled": false, "pluginsConfig": [{"name": "Compute Instance Monitoring", "desiredState": "ENABLED"}, {"name": "Compute Instance Run Command", "desiredState": "ENABLED"}]}' \
-  --wait-for-state RUNNING --wait-for-state TERMINATED --max-wait-seconds "$WAIT_SECONDS" --wait-interval-seconds 20 \
-  --query 'data."lifecycle-state"' --raw-output --no-retry
+# --- 4. Launch; wait until it is RUNNING (or TERMINATED). Full size first; if that has no capacity, the smaller
+#        size right away (fits on more hosts; it can be resized up later: Edit -> Shape, one reboot). -------------
+FULL_SIZE='{"ocpus": 2, "memoryInGBs": 12}'
+SMALL_SIZE='{"ocpus": 1, "memoryInGBs": 6}'
+launch() { # $1 = shape config
+  run_oci compute instance launch \
+    --compartment-id "$T" --availability-domain "$AD" --display-name "$NAME" \
+    --shape "$SHAPE" --shape-config "$1" \
+    --image-id "$IMAGE" --subnet-id "$SUBNET" --assign-public-ip true \
+    --boot-volume-size-in-gbs 100 --is-pv-encryption-in-transit-enabled true \
+    --ssh-authorized-keys-file "$SSH_PUB" --user-data-file "$CI" \
+    --instance-options '{"areLegacyImdsEndpointsDisabled": true}' \
+    --agent-config '{"isMonitoringDisabled": false, "isManagementDisabled": false, "pluginsConfig": [{"name": "Compute Instance Monitoring", "desiredState": "ENABLED"}, {"name": "Compute Instance Run Command", "desiredState": "ENABLED"}]}' \
+    --wait-for-state RUNNING --wait-for-state TERMINATED --max-wait-seconds "$WAIT_SECONDS" --wait-interval-seconds 20 \
+    --query 'data."lifecycle-state"' --raw-output --no-retry
+  STATE="${OUT//[[:space:]]/}"
+}
+SIZE_NOTE=""
+launch "$FULL_SIZE"
+if [ $RC -ne 0 ] && [ $RC -ne 2 ] && [ "$(classify "$ALL")" = capacity ]; then
+  echo "full size: out of capacity — trying the smaller size now"
+  stop_if_exists
+  launch "$SMALL_SIZE"
+  SIZE_NOTE=" It is the smaller size (1 core / 6 GB) because the full size had no room; resize it up later (Edit -> Shape, one reboot)."
+fi
 rm -f "$CI"
-STATE="${OUT//[[:space:]]/}"
 
 case $RC in
   0)
     if [ "$STATE" = "RUNNING" ]; then
-      echo "SUCCESS — the instance is RUNNING."
+      echo "SUCCESS — the instance is RUNNING.${SIZE_NOTE}"
       stop_job "Done: instance created" \
-        "The instance is running. This retry job has switched itself off (and its cron trigger). Next steps are in your private notes."
+        "The instance is running.${SIZE_NOTE} This retry job has switched itself off (and its cron trigger). Next steps are in your private notes."
       exit 0
     fi
     echo "the launch was accepted but the instance ended up ${STATE:-unknown} — will try again next run."
