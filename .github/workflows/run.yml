@@ -1,0 +1,65 @@
+name: retry
+
+# One try per run (see retry.sh). Started every few minutes by an outside cron (workflow_dispatch);
+# GitHub's own schedule below is only a backup (it is often late). Switches itself off when done.
+# Public repo: every identifying value lives in the RETRY_CONFIG secret and is masked in logs.
+on:
+  schedule:
+    - cron: "2-59/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "retry = one normal try; test-trigger-off = only switch the outside cron off; test-success-path = test issue + workflow off/on"
+        type: choice
+        options: [retry, test-trigger-off, test-success-path]
+        default: retry
+
+permissions:
+  contents: read
+  issues: write    # one issue = one email to the owner (done, stopped, or unexpected error)
+  actions: write   # lets the job switch this workflow off when it is done
+
+concurrency:
+  group: retry      # never two tries at once
+  cancel-in-progress: false
+
+jobs:
+  try:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25   # a successful launch waits up to 15 min for RUNNING
+    env:
+      # The one-off network join key expires 7 days after it was made; stop before that. Update when the key changes.
+      TS_KEY_STOP_AFTER: "2026-11-22T18:00:00Z"
+      WORKFLOW_FILE: run.yml
+    steps:
+      # Pinned to an exact commit (v6) so a changed tag can't run new code next to our secrets.
+      # If GitHub can't provide the files (a short GitHub fault), skip this try quietly instead of failing.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        id: checkout
+        continue-on-error: true
+        with:
+          persist-credentials: false
+
+      - name: Skip this try (GitHub could not provide the files)
+        if: steps.checkout.outcome != 'success'
+        run: echo "::warning::GitHub could not provide the repository files this run (temporary GitHub problem); trying again next run."
+
+      - name: Install the provider's command-line tool
+        id: install
+        if: steps.checkout.outcome == 'success'
+        run: |
+          for i in 1 2 3; do pipx install oci-cli && break; sleep 15; done
+          command -v oci >/dev/null || { echo "::warning::could not install the CLI this run; trying again next run"; echo "ok=false" >> "$GITHUB_OUTPUT"; exit 0; }
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+
+      - name: Try once
+        if: steps.checkout.outcome == 'success' && steps.install.outputs.ok == 'true'
+        env:
+          RETRY_CONFIG: ${{ secrets.RETRY_CONFIG }}        # all identifying settings (KEY=VALUE lines)
+          OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_PRIVATE_KEY }}
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+          CRONJOB_API_KEY: ${{ secrets.CRONJOB_API_KEY }}
+          MODE: ${{ inputs.mode || 'retry' }}             # the outside cron and the schedule send no inputs -> retry
+          NOTIFY_USER: ${{ github.repository_owner }}     # mentioned in issues so GitHub emails the owner
+          GH_TOKEN: ${{ github.token }}
+        run: bash retry.sh
